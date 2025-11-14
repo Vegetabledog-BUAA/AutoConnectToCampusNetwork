@@ -1,5 +1,7 @@
 本项目用于校园网的自动重连，目前仅适用于windows系统和Chrome浏览器，所有数据均加密储存在本地用户数据路径C:\Users\\Username\AppData\Local\AutoConnect_chromedriver文件夹下。
 
+安装包链接：https://bhpan.buaa.edu.cn/link/AAF517447738684467B1D19FE740A288A6
+
 注意事项：
 
 1. 首次安装和启动项目需要在系统托盘中右键点击图标打开主界面进行软件配置
