@@ -1,0 +1,11 @@
+{
+    "username": "",
+    "password": "",
+    "check_interval": 300,
+    "test_url": "https://kimi.moonshot.cn",
+    "login_url": "https://gw.buaa.edu.cn/",
+    "log_file_path": "",
+    "chrome_version": "",
+    "chromedriver_path": "",
+    "chromedriver_version": ""
+}
