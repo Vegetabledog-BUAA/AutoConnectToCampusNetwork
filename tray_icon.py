@@ -7,7 +7,7 @@ from PyQt5.QtCore import QTimer, QObject, pyqtSignal, pyqtSlot, Qt
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from logger import log
+from logger import log_with_notification, set_notification_callback, log
 from config import load_config
 from network_checker import NetworkChecker
 
@@ -36,7 +36,7 @@ class UIStarter(QObject):
             self.window.raise_()
             self.window.activateWindow()
         except Exception as e:
-            log(f"显示 GUI 失败: {e}", "ERROR")
+            log_with_notification(f"显示 GUI 失败: {e}", "ERROR", "GUI错误")
 
     def _on_window_destroyed(self, _obj=None):
         self.window = None
@@ -54,12 +54,16 @@ class TrayIconManager(QObject):
         self.check_thread: threading.Thread = None
         self.ui_starter = UIStarter()
         self.config = load_config()
+        
+        # 设置全局通知回调
+        set_notification_callback(self.show_notification)
+        
         self.setup_tray_icon()
 
     def setup_tray_icon(self):
         try:
             if not QSystemTrayIcon.isSystemTrayAvailable():
-                log("系统托盘不可用", "ERROR")
+                log_with_notification("系统托盘不可用", "ERROR", "托盘错误")
                 return
             self.tray_icon = QSystemTrayIcon()
             icon_file = _resource_path('icon.ico')
@@ -70,7 +74,7 @@ class TrayIconManager(QObject):
             self.tray_icon.show()
             log("托盘图标已创建", "INFO")
         except Exception as e:
-            log(f"创建托盘图标失败: {e}", "ERROR")
+            log_with_notification(f"创建托盘图标失败: {e}", "ERROR", "托盘错误")
 
     def create_context_menu(self):
         menu = QMenu()
@@ -96,7 +100,7 @@ class TrayIconManager(QObject):
             self.show_gui()
 
     def show_gui(self):
-        log("从托盘打开 GUI", "INFO")
+        log_with_notification("从托盘打开 GUI", "INFO", "GUI操作")
         self.ui_starter.start_ui_signal.emit()
 
     def toggle_monitoring(self):
@@ -111,26 +115,13 @@ class TrayIconManager(QObject):
             config_update_flag = False
             username = (self.config.get('username') or "").strip()
             password = (self.config.get('password') or "").strip()
-            chrome_version = (self.config.get('chrome_version') or "").strip()
             chromedriver_path = (self.config.get('chromedriver_path') or "").strip()
-            chromedriver_version = (self.config.get('chromedriver_version') or "").strip()
             if not username or not password:
                 return False, "用户名或密码未配置"
-            if not chrome_version:
-                import latest_chromedriver
-                self.config['chrome_version'] = latest_chromedriver.chrome_info.get_version()
-                config_update_flag = True
             if not chromedriver_path:
-                import latest_chromedriver
                 import ubelt as ub
-                dpath = ub.ensure_app_cache_dir('latest_chromedriver')
+                dpath = ub.ensure_app_cache_dir('AutoConnect_chromedriver')
                 self.config['chromedriver_path'] = dpath
-                config_update_flag = True
-            if not chromedriver_version:
-                self.config['chromedriver_version'] = latest_chromedriver.download_driver.get_version(self.config['chromedriver_path'])
-                if self.config['chromedriver_version'] is None:
-                    latest_chromedriver.safely_set_chromedriver_path()
-                    self.config['chromedriver_version'] =  latest_chromedriver.download_driver.get_version(self.config['chromedriver_path'])
                 config_update_flag = True
             if config_update_flag:
                 from config import save_config
@@ -144,10 +135,10 @@ class TrayIconManager(QObject):
             return
         ok, msg = self.has_required_config()
         if not ok:
-            log(f"启动监控被阻止：{msg}", "WARNING")
-            self.show_notification("无法启动监控", msg, 4000)
+            log_with_notification(f"启动监控被阻止：{msg}", "ERROR", "配置错误")
             return
         try:
+            # 不再传递通知回调，因为现在使用全局回调
             self.network_checker = NetworkChecker(self.config)
             self.is_monitoring = True
             self.check_thread = threading.Thread(target=self.network_checker.start_checking, daemon=True)
@@ -155,9 +146,8 @@ class TrayIconManager(QObject):
             self.update_status("运行中")
             self.monitor_action.setText("停止监控")
             log("托盘监控启动", "INFO")
-            self.show_notification("网络监控", "监控已启动")
         except Exception as e:
-            log(f"启动监控失败: {e}", "ERROR")
+            log_with_notification(f"启动监控失败: {e}", "ERROR", "监控错误")
 
     def stop_monitoring(self):
         if not self.is_monitoring:
@@ -170,10 +160,9 @@ class TrayIconManager(QObject):
                 self.check_thread.join(timeout=5)
             self.update_status("已停止")
             self.monitor_action.setText("开始监控")
-            log("托盘监控停止", "INFO")
-            self.show_notification("网络监控", "监控已停止")
+            log_with_notification("托盘监控停止", "INFO", "监控停止")
         except Exception as e:
-            log(f"停止监控失败: {e}", "ERROR")
+            log_with_notification(f"停止监控失败: {e}", "ERROR", "监控错误")
 
     def update_status(self, status):
         if self.status_action:
@@ -192,10 +181,9 @@ class TrayIconManager(QObject):
             if self.network_checker:
                 # 直接替换配置对象，下一轮循环生效
                 self.network_checker.config = self.config
-            log("配置已热更新", "INFO")
-            self.show_notification("配置更新", "新配置已应用", 2500)
+            log_with_notification("配置已热更新", "INFO", "配置通知")
         except Exception as e:
-            log(f"配置热更新失败: {e}", "ERROR")
+            log_with_notification(f"配置热更新失败: {e}", "ERROR", "配置错误")
 
     def show_notification(self, title, message, duration=3000):
         try:
@@ -205,7 +193,6 @@ class TrayIconManager(QObject):
             log(f"通知显示失败: {e}", "WARNING")
 
     def exit_app(self):
-        log("托盘退出请求", "INFO")
         reply = QMessageBox.question(
             None, '确认退出', '确定要退出系统吗？',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
@@ -232,14 +219,12 @@ def start_tray_only():
             QTimer.singleShot(1000, tray_manager.start_monitoring)
         else:
             tray_manager.update_status("已停止")
-            log(f"未自动启动监控：{msg}", "WARNING")
-            tray_manager.show_notification("提示", f"未自动启动监控：{msg}。请打开主界面完成配置。", 5000)
+            log_with_notification(f"未自动启动监控：{msg}", "WARNING", "启动警告")
 
-        tray_manager.show_notification("网络检查系统", "程序已在后台运行（托盘）", 4000)
         log("托盘模式启动完成", "INFO")
         return app, tray_manager
     except Exception as e:
-        log(f"启动托盘模式失败: {e}", "ERROR")
+        log_with_notification(f"启动托盘模式失败: {e}", "ERROR", "启动错误")
         return None, None
 
 __all__ = ["TrayIconManager", "start_tray_only", "tray_manager"]

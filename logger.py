@@ -10,6 +10,9 @@ LOG_FILE = os.path.join(dpath, 'auto_connect.log')
 _logger = None
 _ui_log_handler = None
 
+# 全局通知回调函数
+_notification_callback = None
+
 def setup_logger():
     """设置日志系统"""
     global _logger
@@ -75,6 +78,28 @@ def log(message, level="INFO"):
         _logger.debug(message)
     else:
         _logger.info(message)
+
+def log_with_notification(message, level="INFO", notification_title="系统通知"):
+    """
+    记录日志并发送通知
+    :param message: 日志消息
+    :param level: 日志级别
+    :param notification_title: 通知标题
+    """
+    # 记录日志
+    log(message, level)
+    
+    # 发送通知（仅在严重级别时发送）
+    if _notification_callback:
+        try:
+            _notification_callback(notification_title, message)
+        except Exception as e:
+            log(f"发送通知失败: {e}", "WARNING")
+
+def set_notification_callback(callback_func):
+    """设置通知回调函数"""
+    global _notification_callback
+    _notification_callback = callback_func
 
 def get_logger():
     """获取日志记录器实例"""

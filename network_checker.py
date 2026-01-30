@@ -1,3 +1,4 @@
+
 import os
 import time
 import subprocess
@@ -9,7 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from chromedriver_manager import check_chrome_chromedriver_matched
 
-from logger import log
+from logger import log, log_with_notification
 
 class NetworkChecker:
     def __init__(self, config):
@@ -26,7 +27,7 @@ class NetworkChecker:
             driver_path = (self.config.get('chromedriver_path') or "").strip()
             driver_path = driver_path + "\\chromedriver.exe"
             if not driver_path or not os.path.isfile(driver_path):
-                log("chromedriver_path 未配置或文件不存在", "ERROR")
+                log_with_notification("chromedriver_path 未配置或文件不存在", "ERROR", "配置错误")
                 return False
 
             options = webdriver.ChromeOptions()
@@ -76,7 +77,7 @@ class NetworkChecker:
             return True
             
         except Exception as e:
-            log(f"初始化 ChromeDriver 时出错: {e}", "ERROR")
+            log_with_notification(f"初始化 ChromeDriver 时出错: {e}", "ERROR", "配置错误")
             self.driver = None
             return False
 
@@ -110,18 +111,17 @@ class NetworkChecker:
             if ok:
                 log(f"网络正常: {host}", "INFO")
             else:
-                log(f"网络异常，ping 失败: {host}", "WARNING")
+                log_with_notification(f"网络异常，ping 失败: {host}", "WARNING", "网络警告")
             return ok
         except Exception as e:
-            log(f"执行网络检查失败: {e}", "ERROR")
+            log_with_notification(f"执行网络检查失败: {e}", "ERROR", "网络错误")
             return False
 
     def login(self):
         """简单登录尝试"""
         try:
-            print("执行登录流程...")
             if self.driver is None and not self.initialize_driver():
-                log("无法初始化浏览器，跳过登录", "ERROR")
+                log_with_notification("无法初始化浏览器，跳过登录", "ERROR", "配置错误")
                 return False
 
             user_name = self.config.get('username', '')
@@ -129,13 +129,12 @@ class NetworkChecker:
             login_url = self.config.get('login_url', 'https://gw.buaa.edu.cn/')
 
             if not user_name or not pwd:
-                log("用户名或密码缺失，跳过登录", "WARNING")
+                log_with_notification("用户名或密码缺失，跳过登录", "WARNING", "配置警告")
                 return False
 
             log(f"尝试登录: {login_url}", "INFO")
             self.driver.get(login_url)
             # time.sleep(2)
-
             username_candidates = ["username", "userName", "uname", "loginName", "account"]
             password_candidates = ["password", "pwd", "pass", "passwd"]
             submit_candidates = ["login", "submit", "Log In", "登录", "登 录"]
@@ -187,34 +186,32 @@ class NetworkChecker:
                 except Exception:
                     pass
                 return False
-
             filled_user = try_fill(username_candidates, user_name)
             filled_pwd = try_fill(password_candidates, pwd)
-
             if not filled_user or not filled_pwd:
-                log("填写登录表单失败", "WARNING")
+                log_with_notification("填写登录表单失败", "ERROR", "配置错误")
                 return False
 
             clicked = try_click(submit_candidates)
             if clicked:
                 log("登录提交已点击", "INFO")
             else:
-                log("未找到登录提交按钮", "WARNING")
+                log_with_notification("未找到登录提交按钮", "ERROR", "浏览器错误")
 
             time.sleep(2)
-            log("登录流程完成", "INFO")
+            log_with_notification("登录流程完成", "INFO", "网络重连")
             
             try:
                 self.driver.quit()
                 log("已自动关闭登录浏览器窗口", "INFO")
             except Exception as e:
-                log(f"关闭登录浏览器窗口失败: {e}", "WARNING")
+                log_with_notification(f"关闭登录浏览器窗口失败: {e}", "ERROR", "浏览器错误")
             finally:
                 self.driver = None
 
             return True
         except Exception as e:
-            log(f"登录时发生错误: {e}", "ERROR")
+            log_with_notification(f"登录时发生错误: {e}", "ERROR", "网络错误")
             # 异常时也尽量清理浏览器
             try:
                 if self.driver:
@@ -236,11 +233,12 @@ class NetworkChecker:
 
         while self.is_running:
             ok = self.check_network()
-            check_chrome_chromedriver_matched(extra_para = ok)
-            if not ok:
+            chromedriver_check = check_chrome_chromedriver_matched(extra_para = ok) 
+            if not ok and chromedriver_check:
                 self.attempt_count += 1
-                log(f"尝试重连 (第 {self.attempt_count} 次)", "WARNING")
+                log_with_notification(f"尝试重连 (第 {self.attempt_count} 次)", "WARNING", "网络警告")
                 self.login()
+                
             time.sleep(interval)
 
         log("网络监控已停止", "INFO")
@@ -253,6 +251,6 @@ class NetworkChecker:
             if self.driver:
                 self.driver.quit()
         except Exception as e:
-            log(f"关闭浏览器时错误: {e}", "WARNING")
+            log_with_notification(f"关闭浏览器时错误: {e}", "ERROR", "浏览器错误")
         finally:
             self.driver = None

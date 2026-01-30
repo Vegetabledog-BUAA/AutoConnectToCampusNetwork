@@ -17,9 +17,7 @@ def load_config():
         "test_url": "https://kimi.moonshot.cn",
         "login_url": "https://gw.buaa.edu.cn/",
         "log_file_path": LOG_FILE,
-        "chrome_version": "",
         "chromedriver_path": "",
-        "chromedriver_version": ""
     }
     
     if not os.path.exists(CONFIG_FILE):
