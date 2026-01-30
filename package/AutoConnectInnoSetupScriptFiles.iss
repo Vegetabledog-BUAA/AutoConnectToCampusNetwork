@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "AutoConnect"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Spring Equinox (Beihang University)"
 #define MyAppExeName "AutoConnect.exe"
 
@@ -30,7 +30,7 @@ DisableProgramGroupPage=yes
 ;PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename=AutoConnectSetup
-SetupIconFile=E:\CodeAndFile\git\auto-connect\icon.ico
+SetupIconFile=E:\CodeAndFile\git\AutoConnectToCampusNetwork\icon.ico
 SolidCompression=yes
 WizardStyle=modern dynamic
 
@@ -41,7 +41,7 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "E:\CodeAndFile\git\auto-connect\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "E:\CodeAndFile\git\AutoConnectToCampusNetwork\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
