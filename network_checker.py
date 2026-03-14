@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from chromedriver_manager import check_chrome_chromedriver_matched
 
 from logger import log, log_with_notification
@@ -30,7 +31,7 @@ class NetworkChecker:
                 log_with_notification("chromedriver_path 未配置或文件不存在", "ERROR", "配置错误")
                 return False
 
-            options = webdriver.ChromeOptions()
+            options = Options()
             
             # 无头模式
             options.add_argument("--headless=new")

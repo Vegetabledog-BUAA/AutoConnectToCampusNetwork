@@ -38,16 +38,20 @@ def build():
     # 隐式导入（防止打包后某些动态加载失败）
     hidden_imports = [
         "--hidden-import", "ubelt",
-        "--hidden-import", "selenium",
-        "--hidden-import", "latest_chromedriver",
     ]
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--noconfirm", "--clean",
-        "-F",            # 单文件
-        "-w",            # 无控制台窗口
+        "--noconfirm",
+        "--clean",
+        "-F",
+        "-w",
         "--name", "AutoConnect",
+
+        "--collect-all", "selenium",
+        "--collect-all", "chromedriver_manager",
+        "--collect-all", "latest_chromedriver",
+
         str(MAIN),
     ] + datas + hidden_imports
 
