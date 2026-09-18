@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "AutoConnect"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "Spring Equinox (Beihang University)"
 #define MyAppExeName "AutoConnect.exe"
 

@@ -11,6 +11,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from logger import log_with_notification, set_notification_callback, log
 from config import load_config
 from network_checker import NetworkChecker
+from single_instance import start_show_window_listener
+from updater import check_for_update, STARTUP_DELAY
 
 tray_manager = None
 
@@ -47,6 +49,8 @@ class TrayIconManager(QObject):
     # 通知必须回到 GUI 线程再弹：showMessage 是 Qt 对象操作，
     # 从监控线程直接调用会造成跨线程访问（实测表现就是双击托盘卡死打不开界面）。
     notification_signal = pyqtSignal(str, str, int)
+    # 更新检查的结果同样只能投递信号，不能在工作线程里碰托盘对象
+    update_available_signal = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -63,6 +67,8 @@ class TrayIconManager(QObject):
         self._notification_min_gap = 30
 
         self.notification_signal.connect(self._show_notification, type=Qt.QueuedConnection)
+        self.update_available_signal.connect(
+            self._on_update_available, type=Qt.QueuedConnection)
 
         # 设置全局通知回调
         set_notification_callback(self.show_notification)
@@ -111,6 +117,45 @@ class TrayIconManager(QObject):
     def show_gui(self):
         log_with_notification("从托盘打开 GUI", "INFO", "GUI操作")
         self.ui_starter.start_ui_signal.emit()
+
+    def request_show_gui(self):
+        """响应"新实例请求打开主界面"（由单实例监听线程调用）。
+
+        监听线程不是 GUI 线程，所以这里只投递信号，真正的窗口操作在槽里执行。
+        """
+        try:
+            self.ui_starter.start_ui_signal.emit()
+        except Exception as e:
+            log(f"投递显示主界面请求失败: {e}", "WARNING")
+
+    # ---------------- 更新检查 ----------------
+
+    def check_update_in_background(self):
+        """启动后自动检查更新（节流由 updater 内部负责，24 小时最多一次）。
+
+        只有托盘没开界面时才会走到这里，所以用气泡提示而不是弹对话框；
+        详细说明留给主界面的「检查更新」按钮。
+        """
+        def _run():
+            info = None
+            try:
+                info = check_for_update(force=False)
+            except Exception as e:
+                # updater 内部已兜底，这里是最后一道保险
+                log(f"更新检查异常（已忽略）: {e}", "WARNING")
+            if info is not None:
+                # 工作线程里只投递信号，真正的托盘调用回 GUI 线程
+                self.update_available_signal.emit(info.version, info.download_url)
+
+        threading.Thread(target=_run, name="UpdateCheck", daemon=True).start()
+
+    @pyqtSlot(str, str)
+    def _on_update_available(self, version, _url):
+        """收到"有新版本"（运行在 GUI 线程）"""
+        log(f"发现新版本 {version}，打开主界面可查看详情", "INFO")
+        self.show_notification(
+            "有可用更新",
+            f"发现新版本 {version}，右键托盘图标打开主界面可查看详情", 6000)
 
     def toggle_monitoring(self):
         if self.is_monitoring:
@@ -252,6 +297,14 @@ def start_tray_only():
         app.setQuitOnLastWindowClosed(False)
         tray_manager = TrayIconManager()
         tray_manager.exit_app_signal.connect(app.quit)
+
+        # 单实例保护：接收"新实例请求打开主界面"的事件。
+        # 回调由监听线程触发，request_show_gui 内只 emit 信号，是线程安全的。
+        start_show_window_listener(tray_manager.request_show_gui)
+
+        # 启动后延迟检查更新：有新版只发一条气泡，不打扰正在做的事
+        QTimer.singleShot(int(STARTUP_DELAY * 1000),
+                          tray_manager.check_update_in_background)
 
         # 仅在配置完整时才自动启动监控
         ok, msg = tray_manager.has_required_config()

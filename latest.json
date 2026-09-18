@@ -1,0 +1,7 @@
+{
+  "version": "1.1.1",
+  "download_url": "https://bhpan.buaa.edu.cn/link/AAF517447738684467B1D19FE740A288A6",
+  "notes": "本次更新：\n· 修复 Windows 11 25H2 移除 wmic 后配置无法读取的问题\n· 重写 ChromeDriver 供给链路，修复「Chrome 升级后无法登录」\n· 新增单实例保护，重复启动只会唤起已有窗口\n· 新增按天日志轮转与日志管理器，可配置保留天数\n· 修复监控循环异常导致线程静默退出的问题\n· 登录增加限流与失败退避，配置页布局优化",
+  "mandatory": false,
+  "published_at": "2026-09-19"
+}

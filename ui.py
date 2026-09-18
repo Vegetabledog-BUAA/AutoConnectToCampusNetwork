@@ -2,16 +2,18 @@ import sys
 import os
 import re
 import logging
+import threading
 from html import escape
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QSpinBox,
     QCheckBox, QPushButton, QTextEdit, QGroupBox,
-    QMessageBox, QTabWidget, QFileDialog,
+    QMessageBox, QTabWidget, QFileDialog, QDialog,
     QListWidget, QListWidgetItem, QSplitter, QSizePolicy
 )
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QObject, Qt
-from PyQt5.QtGui import QTextCursor
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, pyqtSlot, QObject, Qt
+from PyQt5.QtGui import QTextCursor, QDesktopServices
+from PyQt5.QtCore import QUrl
 
 # 添加当前目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +23,7 @@ from network_checker import NetworkChecker
 from logger import (
     setup_logger,
     log,
+    log_with_notification,
     set_ui_handler,
     current_log_file,
     list_log_files,
@@ -39,6 +42,13 @@ from auto_start import (
     setup_autostart,
     check_autostart_status,
     can_enable_autostart,
+)
+from single_instance import start_show_window_listener
+from version import __version__
+from updater import (
+    check_for_update,
+    skip_version,
+    STARTUP_DELAY,
 )
 
 # 日志级别与显示颜色的映射（加载历史日志与实时追加共用）
@@ -63,6 +73,21 @@ LOG_PATH_LABEL_WIDTH = 300
 COMPACT_BUTTON_STYLE = "QPushButton { min-width: 0px; padding: 2px 8px; }"
 
 
+def config_row_gap(row_height):
+    """配置页里每两行控件之间的固定间距（像素）。
+
+    行距（相邻两行控件的垂直中心距）= 2 倍行高：控件自身占 1 倍，
+    再额外留 1 倍空隙。
+
+    基准取**控件自身的高度**而不是字体行高 —— 控件还含样式内边距，
+    按字体行高折算出来的间距会挤到几乎没有（实测只有 1px）。
+
+    **刻意返回固定像素值**：行距不能交给布局去伸缩，否则窗口一变高，
+    行与行就被拉开，看起来是"浮动"的。
+    """
+    return max(2, int(round(row_height * 1)))
+
+
 class UIHandler(QObject, logging.Handler):
     """自定义日志处理器，用于将日志发送到UI"""
     log_signal = pyqtSignal(str, str)
@@ -80,6 +105,132 @@ class UIHandler(QObject, logging.Handler):
             self.log_signal.emit(msg, level)
         except Exception:
             pass
+
+
+class UpdateCheckWorker(QObject):
+    """在后台线程里检查更新。
+
+    更新检查要联网，放到 GUI 线程上会卡界面；而它又不是 GUI 线程，
+    所以只能 emit 信号，由接收方用 QueuedConnection 接住再碰控件。
+
+    约定：调用方连接 finished 时**必须**带 `type=Qt.QueuedConnection`。
+    """
+
+    finished = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._busy = False
+
+    def start(self, force=False):
+        """启动一次检查。已有检查在跑时直接忽略，避免重复请求。"""
+        if self._busy:
+            return False
+        self._busy = True
+        thread = threading.Thread(target=self._run, args=(bool(force),),
+                                  name="UpdateCheck", daemon=True)
+        thread.start()
+        return True
+
+    def _run(self, force):
+        info = None
+        try:
+            info = check_for_update(force=force)
+        except Exception as e:
+            # check_for_update 内部已经兜底，这里是最后一道保险
+            log(f"更新检查线程异常（已忽略）: {e}", "WARNING")
+        finally:
+            self._busy = False
+        self.finished.emit(info)
+
+
+class UpdateDialog(QDialog):
+    """提示有新版本。
+
+    只做"看更新说明 + 打开下载页"，**不下载、不替换文件** ——
+    程序是 PyInstaller 单文件 exe，运行时替换自身不可靠，
+    交给用户用安装包覆盖升级最稳。
+    """
+
+    ACTION_DOWNLOAD = "download"
+    ACTION_LATER = "later"
+    ACTION_SKIP = "skip"
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.action = self.ACTION_LATER
+        self._build_ui()
+
+    def _build_ui(self):
+        self.setWindowTitle("发现新版本")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        head = QLabel(
+            f"<b>发现新版本 {escape(self.info.version)}</b>"
+            f"<span style='color:gray'>（当前 {escape(__version__)}）</span>")
+        layout.addWidget(head)
+
+        if self.info.published_at:
+            date_label = QLabel(f"发布日期：{escape(self.info.published_at)}")
+            date_label.setStyleSheet("color: gray; font-size: 11px;")
+            layout.addWidget(date_label)
+
+        notes = QTextEdit()
+        notes.setReadOnly(True)
+        notes.setPlainText(self.info.notes or "（本次更新没有提供说明）")
+        notes.setMinimumHeight(120)
+        notes.setToolTip("可选中复制")
+        layout.addWidget(notes)
+
+        if self.info.mandatory:
+            tip = QLabel("此版本为必需更新，建议尽快升级。")
+            tip.setStyleSheet("color: #b36b00;")
+            layout.addWidget(tip)
+
+        buttons = QHBoxLayout()
+        self.download_btn = QPushButton("去下载")
+        self.download_btn.setDefault(True)
+        self.download_btn.setToolTip(self.info.download_url)
+        self.download_btn.clicked.connect(self._on_download)
+        buttons.addWidget(self.download_btn)
+
+        buttons.addStretch()
+
+        self.later_btn = QPushButton("稍后再说")
+        self.later_btn.clicked.connect(self._on_later)
+        buttons.addWidget(self.later_btn)
+
+        self.skip_btn = QPushButton("跳过此版本")
+        self.skip_btn.setToolTip("在下次版本发布前不再提示该版本")
+        self.skip_btn.clicked.connect(self._on_skip)
+        buttons.addWidget(self.skip_btn)
+
+        layout.addLayout(buttons)
+
+    def _on_download(self):
+        self.action = self.ACTION_DOWNLOAD
+        url = self.info.download_url
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+            log(f"已打开下载页: {url}", "INFO")
+        except Exception as e:
+            log(f"打开下载页失败: {e}", "WARNING")
+            QMessageBox.information(self, "下载地址", f"请在浏览器中打开：\n{url}")
+        self.accept()
+
+    def _on_later(self):
+        self.action = self.ACTION_LATER
+        self.accept()
+
+    def _on_skip(self):
+        self.action = self.ACTION_SKIP
+        skip_version(self.info.version)
+        self.accept()
 
 
 class CheckThread(QThread):
@@ -113,8 +264,12 @@ class CheckThread(QThread):
 
 class MainWindow(QMainWindow):
     # 日志页左右宽度比例（左侧文件管理 : 右侧日志内容）。
-    # 右侧是主要信息展示区，所以尽量少给左侧；22% 是"日期 + 文件大小"还能完整显示的下限。
-    LOG_SPLIT_RATIO = (22, 78)
+    # 右侧是主要信息展示区，所以尽量少给左侧；25% 是"日期 + 文件大小"还能完整显示的下限。
+    LOG_SPLIT_RATIO = (25, 75)
+
+    # 单实例保护：新实例请求打开主界面时，由监听线程 emit，本信号负责把它
+    # 排队回 GUI 线程再真正操作窗口。
+    show_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -123,6 +278,9 @@ class MainWindow(QMainWindow):
         self.ui_handler = None
         self.auto_scroll = True
         self._log_splitter_sized = False
+        self._compact_applied = False
+
+        self.show_requested.connect(self._bring_to_front, type=Qt.QueuedConnection)
 
         self.init_ui()
         self.load_config_values()
@@ -133,12 +291,78 @@ class MainWindow(QMainWindow):
         self.status_sync_timer.timeout.connect(self.sync_monitoring_status)
         self.status_sync_timer.start(1000)  # 每1秒同步一次
 
+        self._setup_update_check()
+
+    def _setup_update_check(self):
+        """准备更新检查：后台线程 + 启动后延迟自动检查一次。
+
+        结果只能经信号回到 GUI 线程，所以连接时必须带 QueuedConnection。
+        """
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.finished.connect(
+            self._on_update_checked, type=Qt.QueuedConnection)
+        # 延迟一会儿再查，且不占用启动的关键路径
+        QTimer.singleShot(STARTUP_DELAY * 1000,
+                          lambda: self._start_update_check(force=False))
+
+    def _start_update_check(self, force):
+        if not self.update_worker.start(force=force):
+            log("更新检查正在进行中，本次请求已忽略", "DEBUG")
+            return
+        if force:
+            self.version_label.setText(f"v{__version__} · 正在检查…")
+            self.check_update_btn.setEnabled(False)
+        log("开始检查更新", "INFO")
+
+    def check_update_manually(self):
+        """「检查更新」按钮：忽略节流，并且无论结果如何都给用户一个反馈。"""
+        self._start_update_check(force=True)
+
+    @pyqtSlot(object)
+    def _on_update_checked(self, info):
+        """更新检查结果回来（运行在 GUI 线程）"""
+        self.check_update_btn.setEnabled(True)
+        if info is None:
+            self.version_label.setText(f"v{__version__} · 已是最新")
+            self.version_label.setToolTip("上次检查：刚刚")
+            return
+
+        self.version_label.setText(f"v{__version__} · 发现新版本 {info.version}")
+        self.version_label.setToolTip("点击「检查更新」查看详情")
+        try:
+            dialog = UpdateDialog(info, self)
+            dialog.exec_()
+        except Exception as e:
+            # 弹窗出问题也不能影响主功能，退回系统托盘通知
+            log(f"显示更新提示失败: {e}", "WARNING")
+            log_with_notification(
+                f"发现新版本 {info.version}，请打开主界面查看", "INFO", "有可用更新")
+
+    def request_show(self):
+        """响应"新实例请求打开主界面"（由单实例监听线程调用，只投递信号）"""
+        self.show_requested.emit()
+
+    @pyqtSlot()
+    def _bring_to_front(self):
+        """把窗口带到前台（运行在 GUI 线程）"""
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception as e:
+            log(f"显示主界面失败: {e}", "WARNING")
+
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("网络自动检查与登录系统")
-        # 日志是主要查看对象，窗口默认给得宽一些，日志区才有足够高度
-        self.setGeometry(100, 100, 920, 700)
-        self.setMinimumSize(720, 520)
+        self.setWindowTitle(f"网络自动检查与登录系统  v{__version__}")
+        # 配置页只有 7 行控件，窗口给太高只会在下面留一大片空白。
+        # 这里先给一个默认尺寸，真正的"紧凑高度"在首次显示后由
+        # _apply_compact_window_size() 按配置页实际所需算出来并固定。
+        self.setGeometry(100, 100, 780, 420)
+        # 宽度可调（便于看日志），高度不可调 —— 否则行距会随窗口浮动
+        self.setMinimumWidth(720)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -151,34 +375,51 @@ class MainWindow(QMainWindow):
 
         # 配置标签页
         config_tab = QWidget()
+        self.config_tab = config_tab
         config_layout = QVBoxLayout(config_tab)
+        config_layout.setContentsMargins(8, 8, 8, 8)
         tabs.addTab(config_tab, "配置")
 
-        # 登录配置组
-        login_group = QGroupBox("登录配置")
-        login_layout = QVBoxLayout(login_group)
+        # 用户配置组：只放账号
+        user_group = QGroupBox("用户配置")
+        user_group_layout = QVBoxLayout(user_group)
+        user_group_layout.setContentsMargins(8, 8, 8, 8)
 
         # 用户名
-        user_layout = QHBoxLayout()
-        user_layout.addWidget(QLabel("用户名:"))
+        username_row = QHBoxLayout()
+        username_row.addWidget(QLabel("用户名:"))
         self.username_input = QLineEdit()
-        user_layout.addWidget(self.username_input)
-        login_layout.addLayout(user_layout)
+        username_row.addWidget(self.username_input)
+        user_group_layout.addLayout(username_row)
 
         # 密码
-        pwd_layout = QHBoxLayout()
-        pwd_layout.addWidget(QLabel("密码:"))
+        pwd_row = QHBoxLayout()
+        pwd_row.addWidget(QLabel("密码:"))
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
-        pwd_layout.addWidget(self.password_input)
-        login_layout.addLayout(pwd_layout)
+        pwd_row.addWidget(self.password_input)
+        user_group_layout.addLayout(pwd_row)
+
+        config_layout.addWidget(user_group)
+
+        # 系统配置组：登录网址 -> 测试网址 -> 检查间隔 -> 日志保留天数 -> 开机自启动
+        system_group = QGroupBox("系统配置")
+        system_layout = QVBoxLayout(system_group)
+        system_layout.setContentsMargins(8, 8, 8, 8)
 
         # 登录网址
         login_url_layout = QHBoxLayout()
         login_url_layout.addWidget(QLabel("登录网址:"))
         self.login_url_input = QLineEdit()
         login_url_layout.addWidget(self.login_url_input)
-        login_layout.addLayout(login_url_layout)
+        system_layout.addLayout(login_url_layout)
+
+        # 测试网址
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("测试网址:"))
+        self.test_url_input = QLineEdit()
+        url_layout.addWidget(self.test_url_input)
+        system_layout.addLayout(url_layout)
 
         # 检查间隔
         interval_layout = QHBoxLayout()
@@ -187,32 +428,9 @@ class MainWindow(QMainWindow):
         self.interval_input.setRange(10, 3600)
         self.interval_input.setSuffix(" 秒")
         interval_layout.addWidget(self.interval_input)
-        login_layout.addLayout(interval_layout)
+        system_layout.addLayout(interval_layout)
 
-        # 测试网址
-        url_layout = QHBoxLayout()
-        url_layout.addWidget(QLabel("测试网址:"))
-        self.test_url_input = QLineEdit()
-        url_layout.addWidget(self.test_url_input)
-        login_layout.addLayout(url_layout)
-
-        config_layout.addWidget(login_group)
-
-        # 系统配置组
-        system_group = QGroupBox("系统配置")
-        system_layout = QVBoxLayout(system_group)
-
-        # 开机自启动
-        self.autostart_checkbox = QCheckBox("开机自动启动")
-        self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
-        system_layout.addWidget(self.autostart_checkbox)
-
-        config_layout.addWidget(system_group)
-
-        # 日志配置组
-        log_group = QGroupBox("日志")
-        log_group_layout = QVBoxLayout(log_group)
-
+        # 日志保留天数
         retention_layout = QHBoxLayout()
         retention_layout.addWidget(QLabel("日志保留天数:"))
         self.retention_input = QSpinBox()
@@ -220,16 +438,21 @@ class MainWindow(QMainWindow):
         self.retention_input.setSuffix(" 天")
         self.retention_input.setToolTip("启动时按此天数清理过期日志文件")
         retention_layout.addWidget(self.retention_input)
-        log_group_layout.addLayout(retention_layout)
+        system_layout.addLayout(retention_layout)
 
-        log_hint = QLabel(
-            f"按天生成日志文件，启动时删除超过保留天数的旧文件；"
-            f"日志页默认回显最近 {RECENT_LOG_DAYS} 天")
-        log_hint.setStyleSheet("color: gray;")
-        log_hint.setWordWrap(True)
-        log_group_layout.addWidget(log_hint)
+        # 开机自启动（放在系统配置组最后）
+        self.autostart_checkbox = QCheckBox("开机自动启动")
+        self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
+        system_layout.addWidget(self.autostart_checkbox)
 
-        config_layout.addWidget(log_group)
+        config_layout.addWidget(system_group)
+
+        # 两个组框都只按内容高度占位，多出来的空间一律留到最下面。
+        # 不做这一步的话 QVBoxLayout 会把剩余空间平分给它们：只有两行的
+        # 「用户配置」被撑得和五行的「系统配置」一样高，行与行之间出现大片空白，
+        # 看起来就是"用户配置太占地方、系统配置太挤"。
+        for box in (user_group, system_group):
+            box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         # 按钮组
         button_layout = QHBoxLayout()
@@ -247,7 +470,26 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         button_layout.addWidget(self.stop_btn)
 
+        button_layout.addStretch()
+
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setToolTip(f"当前版本 {__version__}，点击立即检查是否有新版本")
+        self.check_update_btn.clicked.connect(self.check_update_manually)
+        button_layout.addWidget(self.check_update_btn)
+
         config_layout.addLayout(button_layout)
+
+        # 统一行距：相邻两行控件的中心距 = 1.5 倍行高。
+        # 放在这里设置是因为此时所有输入控件都已建好，可以直接量到真实行高。
+        row_height = self.username_input.sizeHint().height()
+        row_gap = config_row_gap(row_height)
+        for lay in (config_layout, user_group_layout, system_layout):
+            lay.setSpacing(row_gap)
+        self._config_row_height = row_height
+
+        # 剩余空间全部推到底部：让"表单 + 按钮"作为一整块紧贴在顶部，
+        # 不随窗口高度变化而散开
+        config_layout.addStretch(1)
 
         # 日志标签页：左侧日志文件管理，右侧日志内容
         log_tab = QWidget()
@@ -356,6 +598,12 @@ class MainWindow(QMainWindow):
 
         # 状态栏
         self.statusBar().showMessage("就绪")
+        # 版本与更新状态用**常驻标签**显示，不能只用 showMessage ——
+        # 状态栏的临时消息会被每秒一次的 sync_monitoring_status 覆盖掉，
+        # 用户根本看不到"已是最新版本"这类反馈。
+        self.version_label = QLabel(f"v{__version__}")
+        self.version_label.setToolTip("当前版本；点「检查更新」可手动检查新版本")
+        self.statusBar().addPermanentWidget(self.version_label)
 
         # 日志页是隐藏标签页，它的布局要到真正切换到该页时才计算。
         # 所以除了首次显示窗口，切到这个页时也要再校正一次分隔比例。
@@ -363,12 +611,37 @@ class MainWindow(QMainWindow):
         self.log_splitter.splitterMoved.connect(self._on_log_splitter_moved)
 
     def showEvent(self, event):
-        """首次显示后再应用日志页的分隔比例。
+        """首次显示后：算出紧凑高度并固定；再校正日志页分隔比例。
 
-        在 show() 之前调 setSizes 会被 Qt 的首次布局重排覆盖掉（实测退回 50:50），
-        所以放到窗口真正有了尺寸之后再设一次。
+        这两件事都必须等窗口真正有了尺寸才能做：
+        - setSizes / setFixedHeight 在 show() 之前设置会被 Qt 的首次布局覆盖；
+        - 日志页是隐藏标签页，它在此之前没有布局。
         """
         super().showEvent(event)
+        QTimer.singleShot(0, self._apply_compact_window_size)
+
+    def _apply_compact_window_size(self):
+        """把窗口高度收缩到"刚好装下配置页"，并固定住。
+
+        配置页布局的 sizeHint 就是它紧凑所需的高度（末尾的 stretch 贡献 0），
+        再加上标签栏 / 状态栏 / 窗口边框这些固定开销，就是窗口应有的高度。
+        多出来的空间不再被布局分掉，行距也就不会浮动。
+        """
+        if self._compact_applied:
+            return
+        try:
+            self._compact_applied = True
+            overhead = self.height() - self.config_tab.height()
+            content = self.config_tab.layout().sizeHint().height()
+            target = max(content + overhead, self.minimumSizeHint().height())
+
+            self.setFixedHeight(target)
+            log(f"窗口已收缩为紧凑尺寸：{self.width()} x {target}"
+                f"（配置页需 {content}px + 固定开销 {overhead}px）", "INFO")
+        except Exception as e:
+            log(f"计算紧凑窗口尺寸失败: {e}", "WARNING")
+
+        # 高度定下来之后再校正日志页的左右比例
         QTimer.singleShot(0, self._apply_log_splitter_sizes)
 
     def _on_tab_changed(self, index):
@@ -413,7 +686,7 @@ class MainWindow(QMainWindow):
         self.password_input.setText(self.config.get("password", ""))
         self.login_url_input.setText(self.config.get("login_url", "https://gw.buaa.edu.cn/"))
         self.interval_input.setValue(self.config.get("check_interval", 300))
-        self.test_url_input.setText(self.config.get("test_url", "https://kimi.moonshot.cn"))
+        self.test_url_input.setText(self.config.get("test_url", "https://www.taobao.com/"))
         self.retention_input.setValue(
             self.config.get("log_retention_days", DEFAULT_RETENTION_DAYS))
 
@@ -767,6 +1040,10 @@ def start_ui():
 
     window = MainWindow()
     window.show()
+
+    # 单实例保护：接收"新实例请求打开主界面"的事件。
+    # 此时没有托盘进程，窗口就由本进程自己负责显示。
+    start_show_window_listener(window.request_show)
 
     try:
         return app.exec_()

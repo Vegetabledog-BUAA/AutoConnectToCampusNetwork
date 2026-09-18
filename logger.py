@@ -9,9 +9,11 @@
 """
 
 import os
+import sys
 import time
 import datetime
 import logging
+import traceback
 
 import ubelt as ub
 
@@ -373,6 +375,31 @@ def setup_logger():
         _logger.addHandler(console_handler)
 
     return _logger
+
+
+def install_excepthook():
+    """把未捕获异常记进日志，而不是让 PyQt5 直接 abort() 整个进程。
+
+    **这是本项目踩过的一个致命坑。** PyQt5(>=5.5) 在槽函数里抛出未捕获异常时
+    会调用 Qt 的 `qFatal()`，默认行为就是 `abort()`：
+    进程**直接消失，连 Python traceback 都打不出来**，退出码也不指向真正原因。
+    实测：`ui.py` 里一个 `NameError`（漏 import threading）导致点击按钮后程序
+    以退出码 127 静默死掉，日志里一条相关记录都没有。
+
+    PyQt5 官方文档明确：应用自己装了 `sys.excepthook` 时会优先走它，不再 abort。
+    所以这里装一个"只记录、不终止进程"的钩子。
+    """
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            log(f"未捕获异常（已记录，程序继续运行）:\n{text}", "ERROR")
+        except Exception:
+            print(text, file=sys.stderr)
+
+    sys.excepthook = _hook
 
 
 def set_ui_handler(ui_handler):
