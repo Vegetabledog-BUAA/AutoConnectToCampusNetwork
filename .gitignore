@@ -3,3 +3,4 @@ crypto_utils.py
 test.py
 *.exe
 *.pkg
+.workbuddy/

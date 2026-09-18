@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 import threading
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QIcon
@@ -43,6 +44,9 @@ class UIStarter(QObject):
 
 class TrayIconManager(QObject):
     exit_app_signal = pyqtSignal()
+    # 通知必须回到 GUI 线程再弹：showMessage 是 Qt 对象操作，
+    # 从监控线程直接调用会造成跨线程访问（实测表现就是双击托盘卡死打不开界面）。
+    notification_signal = pyqtSignal(str, str, int)
 
     def __init__(self):
         super().__init__()
@@ -54,10 +58,15 @@ class TrayIconManager(QObject):
         self.check_thread: threading.Thread = None
         self.ui_starter = UIStarter()
         self.config = load_config()
-        
+        # 相同通知的最小间隔（秒），避免异常时刷屏弹气泡
+        self._last_notification = {}
+        self._notification_min_gap = 30
+
+        self.notification_signal.connect(self._show_notification, type=Qt.QueuedConnection)
+
         # 设置全局通知回调
         set_notification_callback(self.show_notification)
-        
+
         self.setup_tray_icon()
 
     def setup_tray_icon(self):
@@ -155,9 +164,15 @@ class TrayIconManager(QObject):
         try:
             self.is_monitoring = False
             if self.network_checker:
+                # 只发停止信号：监控循环用的是可中断等待，正常几十毫秒内就退出，
+                # 不会再像以前那样必须等满整个检查间隔（最长 300 秒）。
                 self.network_checker.stop_checking()
             if self.check_thread and self.check_thread.is_alive():
-                self.check_thread.join(timeout=5)
+                # 本方法运行在 Qt 主线程上，join 超时会让界面出现"点了没反应"的
+                # 卡顿感（旧实现固定等 5 秒），因此这里只做一次很短的确认。
+                self.check_thread.join(timeout=1.5)
+                if self.check_thread.is_alive():
+                    log("监控线程正在收尾（可能卡在一次登录尝试中），完成后自动退出", "INFO")
             self.update_status("已停止")
             self.monitor_action.setText("开始监控")
             log_with_notification("托盘监控停止", "INFO", "监控停止")
@@ -186,9 +201,34 @@ class TrayIconManager(QObject):
             log_with_notification(f"配置热更新失败: {e}", "ERROR", "配置错误")
 
     def show_notification(self, title, message, duration=3000):
+        """线程安全的通知入口。
+
+        监控线程会调用这里（log_with_notification 的全局回调），
+        因此只投递信号，真正的 Qt 调用放到 GUI 线程的 _show_notification 里执行。
+        """
         try:
-            if self.tray_icon:
-                self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, duration)
+            self.notification_signal.emit(str(title), str(message), int(duration))
+        except Exception as e:
+            log(f"通知投递失败: {e}", "WARNING")
+
+    @pyqtSlot(str, str, int)
+    def _show_notification(self, title, message, duration):
+        """在 GUI 线程里真正弹出托盘气泡（带同内容节流）"""
+        try:
+            if not self.tray_icon:
+                return
+            now = time.time()
+            key = (title, message)
+            last = self._last_notification.get(key)
+            if last is not None and now - last < self._notification_min_gap:
+                return
+            self._last_notification[key] = now
+            # 只保留最近的若干条，避免字典无限增长
+            if len(self._last_notification) > 50:
+                for old_key in sorted(self._last_notification,
+                                      key=self._last_notification.get)[:25]:
+                    self._last_notification.pop(old_key, None)
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, duration)
         except Exception as e:
             log(f"通知显示失败: {e}", "WARNING")
 

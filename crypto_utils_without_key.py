@@ -9,6 +9,10 @@ from cryptography.hazmat.backends import default_backend
 def get_encryption_key():
     """生成基于电脑固定参数的加密密钥"""
     # 使用电脑的固定参数（如用户名、系统路径等）
+    # !!! 注意：这里把 unique_data 留空，是为了隐去真实的 Key 结构后再公开源码。
+    #     留空时密钥等于 sha256("")，是一个人人可算的公开常量，加密形同虚设，
+    #     仅供二次开发时参照函数结构，请务必自行替换为真实的本机唯一标识。
+    #     仓库根目录下的 crypto_utils.py 是被 .gitignore 忽略的真实实现。
     unique_data = ""
     # 生成 SHA256 哈希值，并截取前 32 字节作为 AES 密钥
     return hashlib.sha256(unique_data.encode('utf-8')).digest()
