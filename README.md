@@ -44,7 +44,8 @@
 | 凭据加密存储 | 账号密码 AES-256-CBC 加密，密钥由本机硬件标识派生，配置内保存密钥指纹用于一致性校验 |
 | 可中断监控循环 | 停止监控毫秒级响应，不必等满一个检查周期 |
 | 单实例保护 | 命名互斥体保证同一时间只有一个实例；重复启动会把已有实例的主界面唤起，不会产生第二个监控线程 |
-| 检查更新 | 启动后自动检查（24 小时最多一次），也可在配置页手动检查；发现新版给出更新说明与下载入口 |
+| 检查更新 | 启动后自动检查（间隔可选：每次启动 / 每天 / 每 3 天 / 每周 / 关闭，默认每天），也可在配置页手动检查；发现新版给出更新说明与下载入口 |
+| 图标与版本信息 | 窗口 / 任务栏 / 托盘 / 快捷方式共用同一份多尺寸图标（16~256），exe 带版本资源，可在「属性 → 详细信息」查看 |
 
 ---
 
@@ -117,8 +118,13 @@ python main.py --doctor   # 环境诊断
 | 登录网址 | `https://gw.buaa.edu.cn/` | 认证门户地址 |
 | 检查间隔 | 300 秒 | 界面可调范围 10~3600 秒；程序内部另有 60 秒登录硬下限 |
 | 测试网址 | `https://kimi.moonshot.cn` | 用于判断外网连通性，建议填稳定且响应快的站点 |
-| 开机自动启动 | 关闭 | 仅打包版可用 |
 | 日志保留天数 | 7 天 | 含今天在内共保留 N 天 |
+| 自动检查更新 | 每天 | 可选「每次启动 / 每天 / 每 3 天 / 每周 / 关闭」。选「关闭」只是不做自动检查，「检查更新」按钮始终可用 |
+| 开机自动启动 | 关闭 | 仅打包版可用 |
+
+> 「自动检查更新」的实际规则：启动后约 20 秒检查一次，距上次检查未满所选间隔就跳过，
+> 跳过时会在日志里写明原因（例如「距上次检查不足 1 天（上次 09-18 21:30），本轮自动跳过」），
+> 不会出现"日志里有一条检查记录却说不出结果"的情况。
 
 ### 日志
 
@@ -188,11 +194,17 @@ AutoConnectToCampusNetwork/
 ├── chromedriver_manager.py      Chrome / ChromeDriver 版本探测与驱动下载安装
 ├── tray_icon.py                 系统托盘
 ├── ui.py                        图形界面：配置页与日志页
+├── dialogs.py                   统一的对话框（中文按钮：确定 / 取消）
+├── app_icon.py                  应用图标：统一解析并挂到窗口、任务栏、托盘
 ├── auto_start.py                开机自启（注册表 / 启动目录）
 ├── single_instance.py           单实例保护（命名互斥体 + 唤起主界面）
-├── version.py                   版本号单一来源 + 更新清单地址
+├── version.py                   版本号单一来源 + 更新清单地址 + 版本资源生成
 ├── updater.py                   更新检查（多源回退、节流、结果缓存）
 ├── latest.json                  更新清单（发布新版本时改这里）
+├── version_info.txt             写进 exe 的版本资源（由 version.py --sync 生成）
+├── icon.ico                     应用图标（含 16~256 全部尺寸）
+├── icon_original.ico            图标原图备份
+├── build_icon.py                由原图重新生成 icon.ico（补齐各尺寸）
 ├── AutoConnect.spec             PyInstaller 打包配置
 ├── build.py                     打包脚本
 └── package/
@@ -212,30 +224,45 @@ python config.py                # 配置路径、密钥指纹与各项取值（�
 python logger.py                # 日志目录、按天文件列表、保留策略
 python chromedriver_manager.py  # 完整驱动诊断，并尝试对齐驱动
 python network_checker.py       # 实测网络探测耗时，验证停止监控的响应速度
+python app_icon.py              # 图标能否被加载、尺寸是否齐全、兜底图标是否可用
+python build_icon.py            # 重新生成 icon.ico，并校验原图两张逐字节未变
+python dialogs.py               # 对话框按钮文案（确定 / 取消）
+python version.py               # 版本号、派生文件一致性、更新清单候选源
+python version.py --sync        # 把 .iss 与 version_info.txt 对齐到 __version__
 ```
 
 ### Build and Package
 
 ```bash
+# 0) 若有改动图标原图：重新生成各尺寸的 icon.ico（会校验原图两张逐字节未变）
+python build_icon.py
+
 # 1) 生成单文件 exe（使用全新目录，避免旧产物被占用）
 python -m PyInstaller AutoConnect.spec --noconfirm --workpath build_new --distpath dist_new
 
 # 2) 以产物覆盖 dist/AutoConnect.exe
 
-# 3) 编译安装包
+# 3) 编译安装包（相对路径以 .iss 所在目录为基准）
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" package\AutoConnectInnoSetupScriptFiles.iss
 ```
 
 打包前需先退出正在运行的托盘程序，否则 `dist/AutoConnect.exe` 被占用会导致替换失败。
 
+`AutoConnect.spec` 的路径全部基于 `SPECPATH` 计算，不写死绝对路径，换机器无需修改。
+
 ### Publishing a New Version
 
 版本号只有一处来源：`version.py` 的 `__version__`。
-`.iss` 里的 `MyAppVersion` 必须同步（`python version.py` 会校验一致性）。
+`.iss` 的 `MyAppVersion` 与 `version_info.txt`（写进 exe 的版本资源）都由它派生：
 
-1. 改 `version.py` 的 `__version__`，并同步 `package/AutoConnectInnoSetupScriptFiles.iss`
-   的 `MyAppVersion`；
-2. 打包 exe 与安装包（见上）；
+```bash
+# 改完 version.py 的 __version__ 后，一条命令对齐两个派生文件
+python version.py --sync    # 同时校验一致性；不一致会以非 0 退出码结束
+```
+
+1. 改 `version.py` 的 `__version__`，执行 `python version.py --sync`；
+2. 打包 exe 与安装包（见上）—— exe 的版本资源会让资源管理器
+   「属性 → 详细信息」显示新版本号；
 3. 上传安装包到分发渠道（北航网盘），拿到分享链接；
 4. 修改仓库根目录的 `latest.json`：`version` 填新版本号，`download_url` 填下载链接，
    `notes` 填更新说明（用 `\n` 换行）；

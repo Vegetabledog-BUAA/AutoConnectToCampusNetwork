@@ -33,6 +33,19 @@ CHECK_INTERVAL_MAX = 7200
 DEFAULT_CHECK_INTERVAL = 300
 DEFAULT_TEST_URL = "https://kimi.moonshot.cn"
 
+# 自动检查更新的间隔（小时）：-1 = 关闭，0 = 每次启动都查，正数 = 至少间隔这么多小时。
+# 界面「系统配置 → 自动检查更新」的下拉框就按这张表来（顺序即显示顺序），
+# 所以界面文案与合法取值只有这一处定义。
+UPDATE_CHECK_OPTIONS = (
+    ("每次启动", 0),
+    ("每天", 24),
+    ("每 3 天", 72),
+    ("每周", 168),
+    ("关闭", -1),
+)
+UPDATE_CHECK_CHOICES = tuple(hours for _, hours in UPDATE_CHECK_OPTIONS)
+DEFAULT_UPDATE_CHECK_HOURS = 24
+
 # 写入前必须齐全的字段。缺任何一个都说明调用方传了不完整的 dict，
 # 这种情况必须拒绝写入，而不是把用户的完整配置覆盖掉。
 REQUIRED_FIELDS = ("check_interval", "test_url", "login_url")
@@ -50,6 +63,7 @@ def _default_config():
         "test_url": DEFAULT_TEST_URL,
         "login_url": "https://gw.buaa.edu.cn/",
         "log_retention_days": DEFAULT_RETENTION_DAYS,
+        "update_check_hours": DEFAULT_UPDATE_CHECK_HOURS,
         "chromedriver_path": "",
     }
 
@@ -120,6 +134,23 @@ def sanitize_config(config):
                 f"[{MIN_RETENTION_DAYS}, {MAX_RETENTION_DAYS}]，已纠正为 {DEFAULT_RETENTION_DAYS}")
             days = DEFAULT_RETENTION_DAYS
         config["log_retention_days"] = days
+
+    # 自动检查更新的间隔：缺失时补默认值（属于新字段，不算异常）；
+    # 给了不在选项里的值才纠正并告警
+    if "update_check_hours" not in config:
+        config["update_check_hours"] = DEFAULT_UPDATE_CHECK_HOURS
+    else:
+        raw_hours = config.get("update_check_hours")
+        try:
+            hours = int(raw_hours)
+        except (TypeError, ValueError):
+            hours = DEFAULT_UPDATE_CHECK_HOURS
+        if hours not in UPDATE_CHECK_CHOICES:
+            notes.append(
+                f"自动检查更新间隔 {raw_hours!r} 不是可选值 "
+                f"{list(UPDATE_CHECK_CHOICES)}，已纠正为 {DEFAULT_UPDATE_CHECK_HOURS} 小时")
+            hours = DEFAULT_UPDATE_CHECK_HOURS
+        config["update_check_hours"] = hours
 
     return notes
 

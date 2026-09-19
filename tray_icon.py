@@ -2,23 +2,26 @@ import sys
 import os
 import time
 import threading
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox
-from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal, pyqtSlot, Qt
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import dialogs
 from logger import log_with_notification, set_notification_callback, log
 from config import load_config
 from network_checker import NetworkChecker
 from single_instance import start_show_window_listener
-from updater import check_for_update, STARTUP_DELAY
+from updater import (
+    check_for_update,
+    auto_check_due,
+    take_auto_check_slot,
+    resolve_interval_hours,
+    STARTUP_DELAY,
+)
+from app_icon import load_icon, apply_to_application
 
 tray_manager = None
-
-def _resource_path(name: str) -> str:
-    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
 
 class UIStarter(QObject):
     start_ui_signal = pyqtSignal()
@@ -81,9 +84,11 @@ class TrayIconManager(QObject):
                 log_with_notification("系统托盘不可用", "ERROR", "托盘错误")
                 return
             self.tray_icon = QSystemTrayIcon()
-            icon_file = _resource_path('icon.ico')
-            if os.path.exists(icon_file):
-                self.tray_icon.setIcon(QIcon(icon_file))
+            # 与主窗口、任务栏共用同一份图标。
+            # 托盘在 100% DPI 下只请求 16x16、125%/150% 下请求 20/24，
+            # 所以这里必须用尺寸齐全的 ico（由 build_icon.py 生成），
+            # 否则系统会从 32x32 缩放，托盘里就是一个糊块。
+            self.tray_icon.setIcon(load_icon())
             self.create_context_menu()
             self.tray_icon.activated.connect(self.on_tray_icon_activated)
             self.tray_icon.show()
@@ -131,15 +136,23 @@ class TrayIconManager(QObject):
     # ---------------- 更新检查 ----------------
 
     def check_update_in_background(self):
-        """启动后自动检查更新（节流由 updater 内部负责，24 小时最多一次）。
+        """启动后自动检查更新（间隔由配置项 update_check_hours 决定）。
 
         只有托盘没开界面时才会走到这里，所以用气泡提示而不是弹对话框；
         详细说明留给主界面的「检查更新」按钮。
         """
+        interval = resolve_interval_hours(
+            (self.config or {}).get("update_check_hours"))
+        due, reason = auto_check_due(interval)
+        if not due:
+            # 写进日志，让"没检查"这件事有据可查
+            log("更新检查：%s" % reason, "INFO")
+            return
+
         def _run():
             info = None
             try:
-                info = check_for_update(force=False)
+                info = check_for_update(force=False, interval_hours=interval)
             except Exception as e:
                 # updater 内部已兜底，这里是最后一道保险
                 log(f"更新检查异常（已忽略）: {e}", "WARNING")
@@ -278,11 +291,8 @@ class TrayIconManager(QObject):
             log(f"通知显示失败: {e}", "WARNING")
 
     def exit_app(self):
-        reply = QMessageBox.question(
-            None, '确认退出', '确定要退出系统吗？',
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
+        # 默认焦点给「取消」：退出是破坏性操作，误按回车不应该生效
+        if dialogs.ask(None, '确认退出', '确定要退出系统吗？'):
             self.tray_icon.hide()
             if self.is_monitoring:
                 self.stop_monitoring()
@@ -294,6 +304,8 @@ def start_tray_only():
         app = QApplication.instance()
         if app is None:
             app = QApplication(sys.argv)
+        # 图标要在任何窗口/托盘建立之前挂上去，顺序反了会先闪一下默认图标
+        apply_to_application(app)
         app.setQuitOnLastWindowClosed(False)
         tray_manager = TrayIconManager()
         tray_manager.exit_app_signal.connect(app.quit)
@@ -302,9 +314,12 @@ def start_tray_only():
         # 回调由监听线程触发，request_show_gui 内只 emit 信号，是线程安全的。
         start_show_window_listener(tray_manager.request_show_gui)
 
-        # 启动后延迟检查更新：有新版只发一条气泡，不打扰正在做的事
-        QTimer.singleShot(int(STARTUP_DELAY * 1000),
-                          tray_manager.check_update_in_background)
+        # 启动后延迟检查更新：有新版只发一条气泡，不打扰正在做的事。
+        # 托盘与主界面都会安排，同一进程只让第一个生效（否则日志里会出现
+        # 两条「开始检查更新」，其中一条必然被节流跳过）。
+        if take_auto_check_slot():
+            QTimer.singleShot(int(STARTUP_DELAY * 1000),
+                              tray_manager.check_update_in_background)
 
         # 仅在配置完整时才自动启动监控
         ok, msg = tray_manager.has_required_config()

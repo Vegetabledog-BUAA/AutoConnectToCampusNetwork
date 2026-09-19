@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QSpinBox,
     QCheckBox, QPushButton, QTextEdit, QGroupBox,
-    QMessageBox, QTabWidget, QFileDialog, QDialog,
+    QTabWidget, QFileDialog, QDialog, QComboBox,
     QListWidget, QListWidgetItem, QSplitter, QSizePolicy
 )
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, pyqtSlot, QObject, Qt
@@ -18,8 +18,15 @@ from PyQt5.QtCore import QUrl
 # 添加当前目录到路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from config import load_config, save_config
+from config import (
+    load_config,
+    save_config,
+    UPDATE_CHECK_OPTIONS,
+    DEFAULT_UPDATE_CHECK_HOURS,
+)
 from network_checker import NetworkChecker
+from app_icon import apply_to_application, apply_to_window
+import dialogs
 from logger import (
     setup_logger,
     log,
@@ -48,6 +55,9 @@ from version import __version__
 from updater import (
     check_for_update,
     skip_version,
+    auto_check_due,
+    take_auto_check_slot,
+    resolve_interval_hours,
     STARTUP_DELAY,
 )
 
@@ -122,20 +132,21 @@ class UpdateCheckWorker(QObject):
         super().__init__()
         self._busy = False
 
-    def start(self, force=False):
+    def start(self, force=False, interval_hours=None):
         """启动一次检查。已有检查在跑时直接忽略，避免重复请求。"""
         if self._busy:
             return False
         self._busy = True
-        thread = threading.Thread(target=self._run, args=(bool(force),),
-                                  name="UpdateCheck", daemon=True)
+        thread = threading.Thread(
+            target=self._run, args=(bool(force), interval_hours),
+            name="UpdateCheck", daemon=True)
         thread.start()
         return True
 
-    def _run(self, force):
+    def _run(self, force, interval_hours=None):
         info = None
         try:
-            info = check_for_update(force=force)
+            info = check_for_update(force=force, interval_hours=interval_hours)
         except Exception as e:
             # check_for_update 内部已经兜底，这里是最后一道保险
             log(f"更新检查线程异常（已忽略）: {e}", "WARNING")
@@ -220,7 +231,7 @@ class UpdateDialog(QDialog):
             log(f"已打开下载页: {url}", "INFO")
         except Exception as e:
             log(f"打开下载页失败: {e}", "WARNING")
-            QMessageBox.information(self, "下载地址", f"请在浏览器中打开：\n{url}")
+            dialogs.info(self, "下载地址", f"请在浏览器中打开：\n{url}")
         self.accept()
 
     def _on_later(self):
@@ -301,12 +312,33 @@ class MainWindow(QMainWindow):
         self.update_worker = UpdateCheckWorker()
         self.update_worker.finished.connect(
             self._on_update_checked, type=Qt.QueuedConnection)
-        # 延迟一会儿再查，且不占用启动的关键路径
-        QTimer.singleShot(STARTUP_DELAY * 1000,
-                          lambda: self._start_update_check(force=False))
+        # 托盘与主界面都会安排自动检查，同一进程只让第一个生效，
+        # 否则启动时会打出两条「开始检查更新」而其中一条必然被跳过 —— 纯噪音。
+        if take_auto_check_slot():
+            # 延迟一会儿再查，且不占用启动的关键路径
+            QTimer.singleShot(STARTUP_DELAY * 1000,
+                              lambda: self._start_update_check(force=False))
+
+    def _update_interval_hours(self):
+        """界面上选择的自动检查间隔（小时）。取不到时回落到默认值。"""
+        try:
+            return resolve_interval_hours(self.update_check_combo.currentData())
+        except Exception:
+            return resolve_interval_hours(DEFAULT_UPDATE_CHECK_HOURS)
 
     def _start_update_check(self, force):
-        if not self.update_worker.start(force=force):
+        interval = self._update_interval_hours()
+
+        if not force:
+            due, reason = auto_check_due(interval)
+            if not due:
+                # 必须把"为什么没检查"写进日志：上一版这条是 DEBUG 级，
+                # 用户只看到一条「开始检查更新」却没有结果，像是凭空多查了一次
+                log("更新检查：%s" % reason, "INFO")
+                self.version_label.setToolTip(reason)
+                return
+
+        if not self.update_worker.start(force=force, interval_hours=interval):
             log("更新检查正在进行中，本次请求已忽略", "DEBUG")
             return
         if force:
@@ -357,6 +389,9 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         """初始化用户界面"""
         self.setWindowTitle(f"网络自动检查与登录系统  v{__version__}")
+        # 窗口图标：不设的话标题栏与 Alt+Tab 会退回 Qt 内置默认图标。
+        # QApplication 级的图标对已经构造好的窗口不一定生效，这里再显式设一次。
+        apply_to_window(self)
         # 配置页只有 7 行控件，窗口给太高只会在下面留一大片空白。
         # 这里先给一个默认尺寸，真正的"紧凑高度"在首次显示后由
         # _apply_compact_window_size() 按配置页实际所需算出来并固定。
@@ -402,7 +437,8 @@ class MainWindow(QMainWindow):
 
         config_layout.addWidget(user_group)
 
-        # 系统配置组：登录网址 -> 测试网址 -> 检查间隔 -> 日志保留天数 -> 开机自启动
+        # 系统配置组：登录网址 -> 测试网址 -> 检查间隔 -> 日志保留天数
+        #            -> 自动检查更新 -> 开机自启动
         system_group = QGroupBox("系统配置")
         system_layout = QVBoxLayout(system_group)
         system_layout.setContentsMargins(8, 8, 8, 8)
@@ -439,6 +475,18 @@ class MainWindow(QMainWindow):
         self.retention_input.setToolTip("启动时按此天数清理过期日志文件")
         retention_layout.addWidget(self.retention_input)
         system_layout.addLayout(retention_layout)
+
+        # 自动检查更新间隔（不想要自动检查就选「关闭」，手动按钮始终可用）
+        update_layout = QHBoxLayout()
+        update_layout.addWidget(QLabel("自动检查更新:"))
+        self.update_check_combo = QComboBox()
+        for label, hours in UPDATE_CHECK_OPTIONS:
+            # 把小时数挂在 item 数据上，显示与取值互不干扰
+            self.update_check_combo.addItem(label, hours)
+        self.update_check_combo.setToolTip(
+            "启动后自动检查新版本的频率；选「关闭」后仍可用右侧「检查更新」按钮手动检查")
+        update_layout.addWidget(self.update_check_combo)
+        system_layout.addLayout(update_layout)
 
         # 开机自启动（放在系统配置组最后）
         self.autostart_checkbox = QCheckBox("开机自动启动")
@@ -690,6 +738,13 @@ class MainWindow(QMainWindow):
         self.retention_input.setValue(
             self.config.get("log_retention_days", DEFAULT_RETENTION_DAYS))
 
+        # 自动检查更新间隔（配置里的值若不在选项内，回落到默认项）
+        hours = resolve_interval_hours(self.config.get("update_check_hours"))
+        index = self.update_check_combo.findData(hours)
+        if index < 0:
+            index = self.update_check_combo.findData(DEFAULT_UPDATE_CHECK_HOURS)
+        self.update_check_combo.setCurrentIndex(index)
+
         # 回显当前启动项状态
         self.autostart_checkbox.blockSignals(True)
         self.autostart_checkbox.setChecked(check_autostart_status())
@@ -712,7 +767,7 @@ class MainWindow(QMainWindow):
             self.autostart_checkbox.blockSignals(True)
             self.autostart_checkbox.setChecked(False)
             self.autostart_checkbox.blockSignals(False)
-            QMessageBox.information(self, "提示", "请运行打包后的 exe 后再启用开机自启动。")
+            dialogs.info(self, "提示", "请运行打包后的 exe 后再启用开机自启动。")
             return
 
         success, message = setup_autostart(enabled)
@@ -728,7 +783,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 5000)
         else:
             log(message, "WARNING")
-            QMessageBox.warning(self, "提示", message)
+            dialogs.warn(self, "提示", message)
 
     def save_config(self, is_start_monitoring=False):
         """保存配置"""
@@ -738,6 +793,7 @@ class MainWindow(QMainWindow):
         self.config["check_interval"] = self.interval_input.value()
         self.config["test_url"] = self.test_url_input.text()
         self.config["log_retention_days"] = self.retention_input.value()
+        self.config["update_check_hours"] = self._update_interval_hours()
 
         save_config(self.config)
 
@@ -770,18 +826,18 @@ class MainWindow(QMainWindow):
         if success:
             log(f"保存配置并设置自启动成功: {message}", "INFO")
             if not is_start_monitoring:
-                QMessageBox.information(self, "成功", f"配置已保存。\n{message}")
+                dialogs.info(self, "成功", f"配置已保存。\n{message}")
         else:
             log(f"保存配置完成，但自启动设置失败: {message}", "WARNING")
             if not is_start_monitoring:
-                QMessageBox.warning(self, "提示", f"配置已保存，但自启动设置失败：\n{message}")
+                dialogs.warn(self, "提示", f"配置已保存，但自启动设置失败：\n{message}")
 
     def _validate_required_before_start(self):
         """校验启动必需项：用户名、密码"""
         username = (self.username_input.text() or "").strip()
         password = (self.password_input.text() or "").strip()
         if not username or not password:
-            QMessageBox.warning(self, "缺少配置", "请先填写用户名与密码。")
+            dialogs.warn(self, "缺少配置", "请先填写用户名与密码。")
             return False
         return True
 
@@ -857,19 +913,16 @@ class MainWindow(QMainWindow):
         """删除选中的日志文件"""
         path = self.selected_log_path()
         if not path:
-            QMessageBox.information(self, "提示", "请先在左侧选择一个日志文件。")
+            dialogs.info(self, "提示", "请先在左侧选择一个日志文件。")
             return
 
         size_kb = os.path.getsize(path) / 1024 if os.path.exists(path) else 0
-        reply = QMessageBox.question(
-            self,
-            "确认删除日志",
-            f"将删除该日志文件，内容不会保留：\n{os.path.basename(path)}"
-            f"（{size_kb:.1f} KB）\n\n确定继续吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+        # 删除是不可逆操作：按钮用「确定 / 取消」，且默认焦点在「取消」
+        if not dialogs.ask(
+                self,
+                "确认删除日志",
+                f"将删除该日志文件，内容不会保留：\n{os.path.basename(path)}"
+                f"（{size_kb:.1f} KB）\n\n确定继续吗？"):
             return
 
         ok, message = delete_log_file(path)
@@ -885,7 +938,7 @@ class MainWindow(QMainWindow):
                 self.refresh_log_list()
         else:
             log(message, "ERROR")
-            QMessageBox.warning(self, "提示", f"{message}\n\n路径：{path}")
+            dialogs.warn(self, "提示", f"{message}\n\n路径：{path}")
 
     # ---------------- 日志展示（右侧） ----------------
 
@@ -979,7 +1032,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("已打开日志所在文件夹", 3000)
             except Exception as e2:
                 log(f"打开日志文件夹也失败: {e2}", "ERROR")
-                QMessageBox.warning(self, "提示", f"无法打开日志文件：{e}\n\n路径：{log_file}")
+                dialogs.warn(self, "提示", f"无法打开日志文件：{e}\n\n路径：{log_file}")
 
     def append_log(self, message, level):
         """追加日志到显示框"""
@@ -1037,6 +1090,9 @@ def start_ui():
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+
+    # 先挂应用级图标，再建窗口 —— 否则窗口会先短暂显示默认图标
+    apply_to_application(app)
 
     window = MainWindow()
     window.show()

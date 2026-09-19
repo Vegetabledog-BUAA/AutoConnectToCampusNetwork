@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "AutoConnect"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "Spring Equinox (Beihang University)"
 #define MyAppExeName "AutoConnect.exe"
 
@@ -15,6 +15,13 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+; 安装包自身的版本资源：不写这几行时，资源管理器「属性 → 详细信息」里
+; 文件版本是空的，用户无法从安装包本身看出是哪个版本
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription=AutoConnect 校园网自动登录 - 安装程序
 DefaultDirName={autopf}\{#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
@@ -30,7 +37,9 @@ DisableProgramGroupPage=yes
 ;PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename=AutoConnectSetup
-SetupIconFile=E:\CodeAndFile\git\AutoConnectToCampusNetwork\icon.ico
+; 相对路径以本脚本所在目录为基准（Inno 的 SourceDir 默认就是脚本目录），
+; 所以换机器、换盘符都不用改这里
+SetupIconFile=..\icon.ico
 SolidCompression=yes
 WizardStyle=modern dynamic
 
@@ -41,12 +50,14 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "E:\CodeAndFile\git\AutoConnectToCampusNetwork\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; IconFilename 显式指向 exe：exe 里已带图标资源（含 16~256 各尺寸），
+; 开始菜单与桌面快捷方式因此与程序本体、托盘保持一致
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

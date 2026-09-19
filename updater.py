@@ -47,10 +47,15 @@ from version import (
 
 # 单次请求的超时（秒）。宁可放弃检查，也不要卡住启动。
 FETCH_TIMEOUT = 6
-# 两次自动检查之间的最小间隔（秒），默认 24 小时
-CHECK_INTERVAL = 24 * 3600
+# 自动检查的默认间隔（小时）。-1 = 关闭，0 = 每次启动都检查，正数 = 至少间隔这么多小时。
+# 实际取值来自配置项 update_check_hours（界面「系统配置 → 自动检查更新」）。
+DEFAULT_INTERVAL_HOURS = 24
 # 启动后延迟多久才开始检查（秒）：让登录这条主链路先跑起来
 STARTUP_DELAY = 20
+
+# 同一进程里只允许安排一次自动检查：托盘与主界面都会尝试安排，
+# 各自安排一次会让启动时出现两条"开始检查更新"日志（实际只有第一条会联网）。
+_process_auto_check_taken = False
 
 _dpath = ub.ensure_app_cache_dir("AutoConnect_chromedriver")
 STATE_FILE = os.path.join(_dpath, "update_state.json")
@@ -113,11 +118,93 @@ def skip_version(version):
     log(f"已跳过版本 {version} 的更新提示", "INFO")
 
 
-def should_check_now(force=False):
-    """自动检查的节流：距上次检查不足 CHECK_INTERVAL 就跳过"""
+def should_check_now(force=False, interval_hours=None):
+    """自动检查的节流：距上次检查不足间隔就跳过。
+
+    保留这个函数名是为了向后兼容；新代码建议直接用 `auto_check_due()`，
+    它会同时给出"为什么跳过"的说明，便于写进日志。
+    """
     if force:
         return True
-    return (time.time() - last_check_at()) >= CHECK_INTERVAL
+    return auto_check_due(interval_hours)[0]
+
+
+def resolve_interval_hours(hours=None):
+    """把配置值规整成合法的间隔小时数。非法值一律回落到默认值。"""
+    if hours is None:
+        return DEFAULT_INTERVAL_HOURS
+    try:
+        value = int(hours)
+    except (TypeError, ValueError):
+        return DEFAULT_INTERVAL_HOURS
+    return -1 if value < -1 else value
+
+
+def format_interval(hours):
+    """把小时数说成人话（用于界面与提示）。"""
+    if hours < 0:
+        return "已关闭"
+    if hours == 0:
+        return "每次启动"
+    if hours == 168:
+        return "每周"
+    if hours % 24 == 0:
+        days = hours // 24
+        return "每天" if days == 1 else "每 %d 天" % days
+    return "每 %d 小时" % hours
+
+
+def _duration_text(hours):
+    """把间隔说成时长，用于「距上次检查不足 X」这类句子。"""
+    if hours % 24 == 0 and hours >= 24:
+        days = hours // 24
+        return "1 天" if days == 1 else "%d 天" % days
+    return "%d 小时" % hours
+
+
+def auto_check_due(interval_hours=None):
+    """现在该不该做一次自动检查。
+
+    :return: (是否到期, 说明)。说明可以直接写进日志 ——
+             上一版的"跳过"日志是 DEBUG 级别，用户看不到，
+             于是只看到一条"开始检查更新"却没有任何结果，像是凭空多查了一次。
+    """
+    hours = resolve_interval_hours(interval_hours)
+    if hours < 0:
+        return False, "自动检查更新已关闭"
+
+    last = last_check_at()
+    if not last:
+        return True, "尚无检查记录，执行首次自动检查"
+    if hours == 0:
+        return True, "已设为每次启动都检查"
+
+    elapsed = time.time() - last
+    if elapsed < hours * 3600:
+        return False, ("距上次检查不足 %s（上次 %s %s），本轮自动跳过"
+                       % (_duration_text(hours),
+                          time.strftime("%m-%d", time.localtime(last)),
+                          time.strftime("%H:%M", time.localtime(last))))
+    return True, "距上次检查已到 %s" % format_interval(hours)
+
+
+def take_auto_check_slot():
+    """同一进程内只允许安排一次自动检查。返回 True 表示本次由你安排。
+
+    托盘与主界面都会安排自动检查，两边都排的话启动时会打出两条
+    "开始检查更新"，其中一条必然被节流跳过 —— 纯噪音。
+    """
+    global _process_auto_check_taken
+    if _process_auto_check_taken:
+        return False
+    _process_auto_check_taken = True
+    return True
+
+
+def reset_auto_check_slot():
+    """仅供测试：恢复"还未安排过自动检查"的状态。"""
+    global _process_auto_check_taken
+    _process_auto_check_taken = False
 
 
 # ------------------------------------------------------------------ 抓取判断
@@ -207,17 +294,22 @@ def build_update_info(manifest, current=__version__):
     )
 
 
-def check_for_update(force=False, current=__version__, urls=None):
+def check_for_update(force=False, current=__version__, urls=None,
+                     interval_hours=None):
     """检查更新。**在后台线程里调用。**
 
     :param force: True 表示忽略节流（用户手动点"检查更新"）
+    :param interval_hours: 自动检查的最小间隔（小时），来自配置项
     :return: UpdateInfo（有新版本且未被跳过）或 None。绝不抛异常。
     """
     try:
-        if not should_check_now(force):
-            log("更新检查：距上次检查不足 %d 小时，本轮跳过"
-                % (CHECK_INTERVAL // 3600), "DEBUG")
-            return None
+        if not force:
+            due, reason = auto_check_due(interval_hours)
+            if not due:
+                # INFO 级别：让用户看得见"为什么没有检查"，
+                # 否则日志里只剩一条"开始检查更新"，像是凭空多查了一次
+                log("更新检查：%s" % reason, "INFO")
+                return None
 
         manifest = fetch_manifest(urls)
         # 无论成功与否都记一次时间，避免网络异常时每次启动都重试
@@ -231,7 +323,7 @@ def check_for_update(force=False, current=__version__, urls=None):
             return None
 
         if not force and info.version == skipped_version():
-            log(f"更新检查：{info.version} 已被用户跳过，不再提示", "DEBUG")
+            log(f"更新检查：{info.version} 已被用户跳过，不再提示", "INFO")
             return None
 
         log(f"更新检查：发现新版本 {info.version}（当前 {current}）", "INFO")
@@ -294,6 +386,27 @@ if __name__ == "__main__":
     skip_version("9.9.9")
     print("  标记跳过后 skipped_version() =", skipped_version())
     skip_version("")
+    print()
+
+    print("--- 3b. 间隔设置，以及「为什么跳过」的说明 ---")
+    for hours, label in ((24, "每天"), (72, "每 3 天"), (168, "每周"),
+                         (0, "每次启动"), (-1, "关闭")):
+        print("  %-8s（%3d 小时）-> 说明: %s" % (label, hours, format_interval(hours)))
+    print("  非法值 99 小时 -> 规整为", resolve_interval_hours(99))
+    print("  非法值 'x'     -> 规整为", resolve_interval_hours("x"))
+    _write_state(last_check=time.time())
+    for hours in (-1, 0, 24, 168):
+        due, why = auto_check_due(hours)
+        print("  刚查过 + 间隔 %-4d 小时 -> 到期=%-5s（%s）" % (hours, due, why))
+    _write_state(last_check=time.time() - 25 * 3600)
+    due, why = auto_check_due(24)
+    print("  25 小时前查过 + 间隔 24 小时 -> 到期=%-5s（%s）" % (due, why))
+    _write_state(last_check=0)
+    print("  从没查过 -> 到期=%s（%s）" % auto_check_due(24))
+    reset_auto_check_slot()
+    print("  同一进程只安排一次自动检查:", take_auto_check_slot(), take_auto_check_slot(),
+          "（期望 True False）")
+    reset_auto_check_slot()
     print()
 
     print("--- 4. 多源回退：三种通道的响应都能解析 ---")

@@ -85,9 +85,13 @@ def run_doctor():
         log(f"[诊断] {line}", "INFO")
 
     try:
-        from PyQt5.QtWidgets import QApplication, QMessageBox
+        from PyQt5.QtWidgets import QApplication
+        from app_icon import apply_to_application
+        import dialogs
         app = QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.information(
+        # 诊断弹窗也要用本程序的图标，否则看着像野窗口
+        apply_to_application(app)
+        dialogs.info(
             None, "环境诊断完成",
             f"诊断报告已保存到：\n{report_path}\n\n同样的内容也写进了日志文件。")
     except Exception:
